@@ -43,6 +43,11 @@ func fixtureModule() *KafkaClient {
 	viper.Set("consumer.test.class-name", "kafka")
 	viper.Set("consumer.test.servers", []string{"broker1.example.com:1234"})
 	viper.Set("consumer.test.cluster", "test")
+	viper.Set("consumer.test-backfill.class-name", "kafka")
+	viper.Set("consumer.test-backfill.servers", []string{"broker1.example.com:1234"})
+	viper.Set("consumer.test-backfill.cluster", "test")
+	viper.Set("consumer.test-backfill.start-latest", true)
+	viper.Set("consumer.test-backfill.backfill-earliest", true)
 
 	return &module
 }
@@ -94,7 +99,7 @@ func TestKafkaClient_partitionConsumer(t *testing.T) {
 	consumer.On("Errors").Return(func() <-chan *sarama.ConsumerError { return errorChan }())
 
 	module.running.Add(1)
-	go module.partitionConsumer(consumer)
+	go module.partitionConsumer(consumer, nil)
 
 	// Send a message over the error channel to make sure it doesn't block
 	testError := &sarama.ConsumerError{
@@ -125,7 +130,7 @@ func TestKafkaClient_partitionConsumer_reports_own_progress(t *testing.T) {
 	consumer.On("Errors").Return(func() <-chan *sarama.ConsumerError { return errorChan }())
 
 	module.running.Add(1)
-	go module.partitionConsumer(consumer)
+	go module.partitionConsumer(consumer, nil)
 
 	// Send a message over the Messages channel and ensure progress gets reported
 	message := &sarama.ConsumerMessage{
@@ -166,6 +171,40 @@ func TestKafkaClient_startKafkaConsumer(t *testing.T) {
 	consumer.On("ConsumePartition", "__consumer_offsets", int32(0), sarama.OffsetOldest).Return(mockPartitionConsumer, nil)
 
 	client := &helpers.MockSaramaClient{}
+	client.On("NewConsumerFromClient").Return(consumer, nil)
+	client.On("Partitions", "__consumer_offsets").Return([]int32{0}, nil)
+
+	err := module.startKafkaConsumer(client)
+	assert.Nil(t, err, "Expected startKafkaConsumer to return no error")
+
+	close(module.quitChannel)
+	module.running.Wait()
+
+	consumer.AssertExpectations(t)
+	client.AssertExpectations(t)
+}
+
+func TestKafkaClient_startKafkaConsumerWithBackfill(t *testing.T) {
+	module := fixtureModule()
+	module.Configure("test", "consumer.test-backfill")
+
+	// Channels for testing
+	messageChan := make(chan *sarama.ConsumerMessage)
+	errorChan := make(chan *sarama.ConsumerError)
+
+	// Don't assert expectations on this - the way it goes down, they're called but don't show up
+	mockPartitionConsumer := &helpers.MockSaramaPartitionConsumer{}
+	mockPartitionConsumer.On("AsyncClose").Return()
+	mockPartitionConsumer.On("Messages").Return(func() <-chan *sarama.ConsumerMessage { return messageChan }())
+	mockPartitionConsumer.On("Errors").Return(func() <-chan *sarama.ConsumerError { return errorChan }())
+
+	consumer := &helpers.MockSaramaConsumer{}
+	consumer.On("ConsumePartition", "__consumer_offsets", int32(0), sarama.OffsetOldest).Return(mockPartitionConsumer, nil)
+	consumer.On("ConsumePartition", "__consumer_offsets", int32(0), sarama.OffsetNewest).Return(mockPartitionConsumer, nil)
+
+	client := &helpers.MockSaramaClient{}
+	client.On("GetOffset", "__consumer_offsets", int32(0), sarama.OffsetOldest).Return(int64(123), nil)
+	client.On("GetOffset", "__consumer_offsets", int32(0), sarama.OffsetNewest).Return(int64(456), nil)
 	client.On("NewConsumerFromClient").Return(consumer, nil)
 	client.On("Partitions", "__consumer_offsets").Return([]int32{0}, nil)
 
@@ -280,7 +319,31 @@ func TestKafkaClient_decodeMetadataValueHeaderV2(t *testing.T) {
 	assert.Equalf(t, "range", result.Protocol, "Expected Protocol to be range, not %v", result.Protocol)
 	assert.Equalf(t, "tLeader-a42d2baa-bfaa-4b96-9ea2-dee5f42b2ab2", result.Leader, "Expected Leader to be tLeader-a42d2baa-bfaa-4b96-9ea2-dee5f42b2ab2, not %v", result.Leader)
 	assert.Equalf(t, int64(1552078883402), result.CurrentStateTimestamp, "Expected CurrentStateTimestamp to be 1552078883402, not %v", result.CurrentStateTimestamp)
-	assert.Equalf(t, "", errorAt, "Expected decodeMetadataValueHeader to return empty errorAt, not %v", errorAt)
+	assert.Equalf(t, "", errorAt, "Expected decodeMetadataValueHeaderV2 to return empty errorAt, not %v", errorAt)
+}
+
+func TestKafkaClient_decodeMetadataValueHeaderV3(t *testing.T) {
+	var valueVersion int16
+	metadata := "\x00\x03\x00"                                                                                           // Header Version 3
+	metadata += "\x08consumer"                                                                                           // Protocol Type
+	metadata += "\x00\x00\x00\x01\x00\x12RoundRobinAssigner\x00,tLeader-a42d2baa-bfaa-4b96-9ea2-dee5f42b2ab2"            // Generation, Protocol, Leader
+	metadata += "\x00\x00\x01l\xDF5\x07k\x00\x00\x00\x01"                                                                // Timestamp
+	metadata += "\x00\x06member\xFF\xFF\x00\x06client\x00\x0D/10.10.10.100\xFF\xFF\xFF\xFF\x00\x00\x75\x30"              // Member Metadata
+	metadata += "\x00\x00\x00\x12\x00\x01\x00\x00\x00\x01\x00\x06topic1\x00\x00\x00\x00"                                 // Member Metadata
+	metadata += "\x00\x00\x00\x1A\x00\x01\x00\x00\x00\x01\x00\x06topic1\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00" // Member Metadata
+	value := []byte(metadata)
+
+	valueBuffer := bytes.NewBuffer(value)
+	binary.Read(valueBuffer, binary.BigEndian, &valueVersion)
+	assert.Equalf(t, int16(3), valueVersion, "Expected valueVersion to be 3, not %v", valueVersion)
+
+	result, errorAt := decodeMetadataValueHeaderV2(valueBuffer)
+	assert.Equalf(t, "consumer", result.ProtocolType, "Expected ProtocolType to be consumer, not %v", result.ProtocolType)
+	assert.Equalf(t, int32(1), result.Generation, "Expected Generation to be 1, not %v", result.Generation)
+	assert.Equalf(t, "RoundRobinAssigner", result.Protocol, "Expected protocol to be RoundRobinAssigner, not %v", result.Protocol)
+	assert.Equalf(t, "tLeader-a42d2baa-bfaa-4b96-9ea2-dee5f42b2ab2", result.Leader, "Expected Leader to be tLeader-a42d2baa-bfaa-4b96-9ea2-dee5f42b2ab2, not %v", result.Leader)
+	assert.Equalf(t, int64(1567112890219), result.CurrentStateTimestamp, "Expected CurrentStateTimestamp to be 1567112890219, not %v", result.CurrentStateTimestamp)
+	assert.Equalf(t, "", errorAt, "Expected decodeMetadataValueHeaderV2 to return empty errorAt, not %v", errorAt)
 }
 
 var decodeMetadataValueHeaderErrors = []errorTestSetBytesWithString{
@@ -307,6 +370,30 @@ func TestKafkaClient_decodeMetadataMember(t *testing.T) {
 	assert.Equalf(t, "testclienthost", result.ClientHost, "Expected ClientHost to be testclienthost, not %v", result.ClientHost)
 	assert.Equalf(t, int32(4), result.RebalanceTimeout, "Expected RebalanceTimeout to be 4, not %v", result.RebalanceTimeout)
 	assert.Equalf(t, int32(8), result.SessionTimeout, "Expected SessionTimeout to be 8, not %v", result.SessionTimeout)
+}
+
+func TestKafkaClient_decodeMetadataMemberV3(t *testing.T) {
+	metadata := "\x00\x06member\xFF"                                                                                     // memberID
+	metadata += "\xFF"                                                                                                   // groupInstanceID
+	metadata += "\x00\x06client\x00"                                                                                     // clientID
+	metadata += "\x0D/10.10.10.100"                                                                                      // clientHost
+	metadata += "\xFF\xFF\xFF\xFF"                                                                                       // rebalanceTimeout
+	metadata += "\x00\x00\x75\x30"                                                                                       // seesionTimeout
+	metadata += "\x00\x00\x00\x12\x00\x01\x00\x00\x00\x01\x00\x06topic1\x00\x00\x00\x00"                                 // subscription
+	metadata += "\x00\x00\x00\x1A\x00\x01\x00\x00\x00\x01\x00\x06topic1\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00" // assignment
+	value := []byte(metadata)
+	valueBuffer := bytes.NewBuffer(value)
+
+	result, errorAt := decodeMetadataMember(valueBuffer, 3)
+
+	assert.Equalf(t, "", errorAt, "Expected decodeMetadataMember to return empty errorAt, not %v", errorAt)
+	assert.Equalf(t, "member", result.MemberID, "Expected MemberID to be member, not %v", result.MemberID)
+	assert.Equalf(t, "", result.GroupInstanceID, "Expected GroupInstanceID to be \"\" not %v", result.GroupInstanceID)
+	assert.Equalf(t, "client", result.ClientID, "Expected ClientID to be client, not %v", result.ClientID)
+	assert.Equalf(t, "/10.10.10.100", result.ClientHost, "Expected ClientHost to be /10.10.10.100, not %v", result.ClientHost)
+	assert.Equalf(t, int32(-1), result.RebalanceTimeout, "Expected RebalanceTimeout to be -1, not %v", result.RebalanceTimeout)
+	assert.Equalf(t, int32(30000), result.SessionTimeout, "Expected SessionTimeout to be 30000, not %v", result.SessionTimeout)
+	assert.Equalf(t, []int32{0}, result.Assignment["topic1"], "Expected topic1 assignment to be {0}, not %v", result.Assignment["topic1"])
 }
 
 var decodeMetadataMemberErrors = []errorTestSetBytesWithString{
@@ -430,7 +517,7 @@ func TestKafkaClient_decodeKeyAndOffset(t *testing.T) {
 	keyBuf := bytes.NewBuffer([]byte("\x00\x09testgroup\x00\x09testtopic\x00\x00\x00\x0b"))
 	valueBytes := []byte("\x00\x00\x00\x00\x00\x00\x00\x00\x20\xb4\x00\x08testdata\x00\x00\x00\x00\x00\x00\x06\x65")
 
-	go module.decodeKeyAndOffset(keyBuf, valueBytes, zap.NewNop())
+	go module.decodeKeyAndOffset(543, keyBuf, valueBytes, zap.NewNop())
 	request := <-module.App.StorageChannel
 
 	assert.Equalf(t, protocol.StorageSetConsumerOffset, request.RequestType, "Expected request sent with type StorageSetConsumerOffset, not %v", request.RequestType)
@@ -439,6 +526,7 @@ func TestKafkaClient_decodeKeyAndOffset(t *testing.T) {
 	assert.Equalf(t, int32(11), request.Partition, "Expected request sent with partition 0, not %v", request.Partition)
 	assert.Equalf(t, "testgroup", request.Group, "Expected request sent with Group testgroup, not %v", request.Group)
 	assert.Equalf(t, int64(8372), request.Offset, "Expected Offset to be 8372, not %v", request.Offset)
+	assert.Equalf(t, int64(543), request.Order, "Expected Order to be 543, not %v", request.Offset)
 	assert.Equalf(t, int64(1637), request.Timestamp, "Expected Timestamp to be 1637, not %v", request.Timestamp)
 }
 
@@ -454,7 +542,7 @@ func TestKafkaClient_decodeKeyAndOffset_BadValueVersion(t *testing.T) {
 
 	for _, values := range decodeKeyAndOffsetErrors {
 		// Should not timeout
-		module.decodeKeyAndOffset(bytes.NewBuffer(values.KeyBytes), values.ValueBytes, zap.NewNop())
+		module.decodeKeyAndOffset(0, bytes.NewBuffer(values.KeyBytes), values.ValueBytes, zap.NewNop())
 	}
 }
 
@@ -467,7 +555,7 @@ func TestKafkaClient_decodeKeyAndOffset_Whitelist(t *testing.T) {
 	valueBytes := []byte("\x00\x00\x00\x00\x00\x00\x00\x00\x20\xb4\x00\x08testdata\x00\x00\x00\x00\x00\x00\x06\x65")
 
 	// Should not timeout as the group should be dropped by the whitelist
-	module.decodeKeyAndOffset(keyBuf, valueBytes, zap.NewNop())
+	module.decodeKeyAndOffset(0, keyBuf, valueBytes, zap.NewNop())
 }
 
 func TestKafkaClient_decodeAndSendOffset_ErrorValue(t *testing.T) {
@@ -481,7 +569,7 @@ func TestKafkaClient_decodeAndSendOffset_ErrorValue(t *testing.T) {
 	}
 	valueBuf := bytes.NewBuffer([]byte("\x00\x00\x00\x00\x00\x00\x00\x00\x20\xb4\x00\x08testd"))
 
-	module.decodeAndSendOffset(offsetKey, valueBuf, zap.NewNop(), decodeOffsetValueV0)
+	module.decodeAndSendOffset(0, offsetKey, valueBuf, zap.NewNop(), decodeOffsetValueV0)
 	// Should not timeout
 }
 
