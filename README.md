@@ -1,3 +1,8 @@
+> [!WARNING]
+> **This repository is scheduled to be archived on 13th November 2026.**
+>
+> After that date it will be read-only: no new commits, issues, or pull requests, and no further maintenance or security updates will be issued.
+
 [![Join the chat at https://gitter.im/linkedin-Burrow/Lobby](https://badges.gitter.im/linkedin-Burrow/Lobby.svg)](https://gitter.im/linkedin-Burrow/Lobby?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge&utm_content=badge)
 [![Build Status](https://travis-ci.org/linkedin/Burrow.svg)](https://travis-ci.org/linkedin/Burrow)
 [![go report card](https://goreportcard.com/badge/github.com/linkedin/Burrow)](https://goreportcard.com/report/github.com/linkedin/Burrow)
